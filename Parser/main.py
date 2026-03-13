@@ -14,10 +14,15 @@ class WBParserAPI:
             level=logging.ERROR,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
+        # Актуальные заголовки для обхода базовых проверок WB в 2026 году
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
             'Accept': '*/*',
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://www.wildberries.ru/',
+            'Origin': 'https://www.wildberries.ru',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'x-client-name': 'web'
         }
 
     def extract_sku(self, url: str) -> Optional[str]:
@@ -33,23 +38,35 @@ class WBParserAPI:
             return None
 
         try:
-            api_url = f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
+            # Используем версию v2 и стандартные параметры для Москвы (-1257786)
+            api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
             
             response = requests.get(api_url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 429:
+                logging.error(f"Rate limited (429) for SKU {sku}. Try using a proxy.")
+                return None
+            elif response.status_code == 498:
+                logging.error(f"Anti-bot Challenge (498) triggered for SKU {sku}. WBAAS protection active.")
+                return None
+                
             response.raise_for_status()
             data = response.json()
 
             products = data.get('data', {}).get('products', [])
             if not products:
-                logging.error(f"No product data found for SKU: {sku}")
+                logging.error(f"No product data found for SKU: {sku} (Status 200, but empty list)")
                 return None
 
             p = products[0]
             
             title = p.get('name', 'Не указано')
+            # В 2026 году цены могут приходить в salePriceU (в копейках)
             final_price = p.get('salePriceU', 0) // 100
             reviews = p.get('feedbacks', 0)
-            delivery_date = "Доступно" if p.get('totalQuantity', 0) > 0 else "Нет в наличии"
+            # Расширенная проверка остатков
+            total_qty = sum(size.get('stocks', [0])[0] if isinstance(size.get('stocks'), list) else 0 for size in p.get('sizes', []))
+            delivery_date = "Доступно" if total_qty > 0 or p.get('totalQuantity', 0) > 0 else "Нет в наличии"
 
             return {
                 'title': title,
@@ -103,9 +120,12 @@ def main():
         data = parser.parse_product(url)
         if data:
             results.append(data)
+        else:
+            print(f"  [!] Failed to get data for {url}. Check errors.log")
 
     if not results:
-        print("No data collected.")
+        print("\nNo data collected. Check Parser/result/errors.log for details.")
+        print("Tip: If you see 498/429 errors, Wildberries is blocking your IP or requires JS challenge solving.")
         return
 
     df = pd.DataFrame(results)
