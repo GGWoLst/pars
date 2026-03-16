@@ -1,11 +1,13 @@
 import os
 import re
-import requests
 import pandas as pd
 import logging
+import time
 from typing import List, Dict, Optional
+from seleniumbase import SB
+from bs4 import BeautifulSoup
 
-class WBParserAPI:
+class WBParserBrowser:
     def __init__(self, result_dir: str):
         self.result_dir = result_dir
         os.makedirs(self.result_dir, exist_ok=True)
@@ -14,70 +16,50 @@ class WBParserAPI:
             level=logging.ERROR,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
-        # Актуальные заголовки для обхода базовых проверок WB в 2026 году
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': 'https://www.wildberries.ru/',
-            'Origin': 'https://www.wildberries.ru',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'x-client-name': 'web'
-        }
 
-    def extract_sku(self, url: str) -> Optional[str]:
-        match = re.search(r'catalog/(\d+)/detail', url)
-        if match:
-            return match.group(1)
-        return None
-
-    def parse_product(self, url: str) -> Optional[Dict]:
-        sku = self.extract_sku(url)
-        if not sku:
-            logging.error(f"Could not extract SKU from URL: {url}")
-            return None
-
+    def parse_product(self, sb, url: str) -> Optional[Dict]:
         try:
-            # Используем версию v2 и стандартные параметры для Москвы (-1257786)
-            api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
+            # Открываем страницу в режиме undetected-chromedriver
+            sb.uc_open_with_reconnect(url, 15)
+            # Ждем прогрузки SKU (теперь это основной признак страницы товара)
+            sb.wait_for_element('[data-testid]', timeout=15)
             
-            response = requests.get(api_url, headers=self.headers, timeout=10)
+            # Если выскочила капча, пробуем нажать "Я не робот" (если есть)
+            if sb.is_element_visible('iframe[src*="challenge"]'):
+                 sb.uc_gui_click_captcha()
             
-            if response.status_code == 429:
-                logging.error(f"Rate limited (429) for SKU {sku}. Try using a proxy.")
-                return None
-            elif response.status_code == 498:
-                logging.error(f"Anti-bot Challenge (498) triggered for SKU {sku}. WBAAS protection active.")
-                return None
-                
-            response.raise_for_status()
-            data = response.json()
-
-            products = data.get('data', {}).get('products', [])
-            if not products:
-                logging.error(f"No product data found for SKU: {sku} (Status 200, but empty list)")
-                return None
-
-            p = products[0]
+            # Получаем HTML-код страницы
+            html = sb.get_page_source()
+            soup = BeautifulSoup(html, 'html.parser')
             
-            title = p.get('name', 'Не указано')
-            # В 2026 году цены могут приходить в salePriceU (в копейках)
-            final_price = p.get('salePriceU', 0) // 100
-            reviews = p.get('feedbacks', 0)
-            # Расширенная проверка остатков
-            total_qty = sum(size.get('stocks', [0])[0] if isinstance(size.get('stocks'), list) else 0 for size in p.get('sizes', []))
-            delivery_date = "Доступно" if total_qty > 0 or p.get('totalQuantity', 0) > 0 else "Нет в наличии"
+            # Извлекаем данные (селекторы для 2026 года)
+            # Заголовок: ищем в span с классом productImtName или старые варианты
+            title_elem = soup.select_one('[class*="productImtName"], .product-page__header h1, h1')
+            title = title_elem.get_text(strip=True) if title_elem else "Не указано"
+            
+            # Цена: ищем в разных возможных блоках (WB часто меняет классы)
+            price_elem = soup.select_one('[class*="productLinePriceWallet"], ins.price-block__final-price, .price-block__final-price, .current-price')
+            price_text = price_elem.get_text(strip=True) if price_elem else "0"
+            # Очистка цены от символов рубля и пробелов
+            price = int(re.sub(r'\D', '', price_text)) if price_text else 0
+            
+            # Отзывы
+            reviews_elem = soup.select_one('[class*="reviewCount"], .product-review__count, .address-rate-count')
+            reviews_text = reviews_elem.get_text(strip=True) if reviews_elem else "0"
+            reviews = int(re.sub(r'\D', '', reviews_text)) if reviews_text else 0
+            
+            # Наличие
+            is_available = "Нет в наличии" if soup.select_one('.product-page__order-status--out-of-stock, .sold-out, [class*="sold-out"]') else "Доступно"
 
             return {
                 'title': title,
-                'final_price': final_price,
+                'final_price': price,
                 'reviews': reviews,
-                'delivery_date': delivery_date,
+                'delivery_date': is_available,
                 'url': url
             }
-
         except Exception as e:
-            logging.error(f"Error parsing {url} via API: {str(e)}")
+            logging.error(f"Error parsing {url}: {str(e)}")
             return None
 
 def read_links(filepath: str) -> List[str]:
@@ -98,44 +80,45 @@ def main():
     result_file_txt = os.path.join(result_dir, 'result.txt')
     result_file_xlsx = os.path.join(result_dir, 'result.xlsx')
 
-    os.makedirs(os.path.join(base_dir, 'main_base'), exist_ok=True)
-    os.makedirs(os.path.join(base_dir, 'compare_base'), exist_ok=True)
-    os.makedirs(result_dir, exist_ok=True)
-
     main_links = read_links(main_link_file)
     compare_links = read_links(compare_link_file)
     all_links = main_links + compare_links
     
     if not all_links:
-        print("No links found. Please fill the .txt files in main_base and compare_base.")
+        print("No links found.")
         return
 
-    print(f"Starting API parser for {len(all_links)} links...")
+    print(f"Starting Browser-based parser for {len(all_links)} links...")
+    print("This method is slower but bypasses WBAAS protection.")
     
-    parser = WBParserAPI(result_dir)
     results = []
+    parser = WBParserBrowser(result_dir)
 
-    for i, url in enumerate(all_links, 1):
-        print(f"Processing {i}/{len(all_links)}: {url}")
-        data = parser.parse_product(url)
-        if data:
-            results.append(data)
-        else:
-            print(f"  [!] Failed to get data for {url}. Check errors.log")
+    # Запускаем SeleniumBase в режиме UC (Undetected Chromedriver)
+    with SB(uc=True, headless2=True) as sb:
+        for i, url in enumerate(all_links, 1):
+            print(f"Processing {i}/{len(all_links)}: {url}")
+            data = parser.parse_product(sb, url)
+            if data:
+                results.append(data)
+            else:
+                print(f"  [!] Failed to get data for {url}. See errors.log")
+            
+            # Небольшая пауза между страницами для реалистичности
+            time.sleep(2)
 
     if not results:
-        print("\nNo data collected. Check Parser/result/errors.log for details.")
-        print("Tip: If you see 498/429 errors, Wildberries is blocking your IP or requires JS challenge solving.")
+        print("\nNo data collected. Check Parser/result/errors.log")
         return
 
     df = pd.DataFrame(results)
     df.columns = ['Название', 'Цена', 'Количество_отзывов', 'Дата_доставки', 'Ссылка']
     df = df.sort_values(by='Цена')
-
+    
     df.to_csv(result_file_txt, sep=';', index=False, encoding='utf-8')
     df.to_excel(result_file_xlsx, index=False)
             
-    print(f"\nSuccess! Results saved to:\n - {result_file_txt}\n - {result_file_xlsx}")
+    print(f"\nSuccess! Results saved to result/ folder.")
 
 if __name__ == "__main__":
     main()
